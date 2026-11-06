@@ -1,0 +1,485 @@
+import asyncio
+import threading
+import time
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
+
+import msgpack
+import pytest
+from msgpack.ext import Timestamp
+
+from alpaca.common.utils import get_default_user_agent, get_websocket_headers_key
+from alpaca.data.enums import DataFeed, Exchange
+from alpaca.data.live.stock import StockDataStream
+from alpaca.data.live.websocket import DataStream
+from alpaca.data.models import Bar, News, Trade
+from alpaca.data.models.news import News
+from alpaca.data.models.orderbooks import Orderbook, OrderbookQuote
+from alpaca.data.models.quotes import Quote
+from alpaca.data.models.trades import TradeCancel, TradingStatus
+
+
+@pytest.fixture
+def ws_client() -> DataStream:
+    """Socket client fixture with pydantic models as output."""
+    return DataStream("endpoint", "key-id", "secret-key")
+
+
+@pytest.fixture
+def raw_ws_client() -> DataStream:
+    """Socket client fixture with raw data output."""
+    return DataStream("endpoint", "key-id", "secret-key", raw_data=True)
+
+
+@pytest.fixture
+def timestamp() -> Timestamp:
+    """Msgpack mock timestamp."""
+    return Timestamp(seconds=10, nanoseconds=10)
+
+
+def test_cast(ws_client: DataStream, raw_ws_client: DataStream, timestamp: Timestamp):
+    bar = ws_client._cast(
+        {
+            "T": "b",
+            "S": "AAPL",
+            "o": 177.94,
+            "c": 178.005,
+            "h": 178.005,
+            "l": 177.94,
+            "v": 8547,
+            "t": timestamp,
+            "n": 66,
+            "vw": 177.987562,
+        },
+    )
+    assert type(bar) == Bar
+    assert bar.symbol == "AAPL"
+    assert bar.high == 178.005
+
+    trade = ws_client._cast(
+        {
+            "T": "t",
+            "S": "AAPL",
+            "i": 6142,
+            "x": "V",
+            "p": 177.79,
+            "s": 90,
+            "c": ["@", "I"],
+            "z": "C",
+            "t": timestamp,
+        },
+    )
+    assert type(trade) == Trade
+    assert trade.symbol == "AAPL"
+    assert trade.price == 177.79
+    assert trade.exchange == Exchange.V
+
+    quote = ws_client._cast(
+        {
+            "T": "q",
+            "S": "SPIP",
+            "bx": "V",
+            "bp": 25.41,
+            "bs": 35,
+            "ax": "V",
+            "ap": 25.43,
+            "as": 35,
+            "c": ["R"],
+            "z": "B",
+            "t": timestamp,
+        },
+    )
+    assert type(quote) == Quote
+    assert quote.symbol == "SPIP"
+    assert quote.bid_price == 25.41
+    assert quote.ask_size == 35
+    assert quote.conditions == ["R"]
+
+    orderbook = ws_client._cast(
+        {
+            "T": "o",
+            "S": "BTC/USD",
+            "t": timestamp,
+            "b": [{"p": 65128.1, "s": 1.6542}],
+            "a": [{"p": 65128.1, "s": 1.6542}],
+        },
+    )
+    assert type(orderbook) == Orderbook
+    assert orderbook.symbol == "BTC/USD"
+    assert orderbook.bids == [OrderbookQuote(p=65128.1, s=1.6542)]
+
+    trading_status = ws_client._cast(
+        {
+            "T": "s",
+            "S": "STRR",
+            "t": timestamp,
+            "sc": "T",
+            "sm": "Trading Resumption",
+            "rc": "C11",
+            "rm": "",
+            "z": "C",
+        },
+    )
+    assert type(trading_status) == TradingStatus
+    assert trading_status.status_code == "T"
+
+    cancel = ws_client._cast(
+        {
+            "T": "x",
+            "S": "DJT",
+            "i": 4868,
+            "x": "D",
+            "p": 36.18,
+            "s": 31800,
+            "a": "C",
+            "z": "C",
+            "t": timestamp,
+        },
+    )
+    assert type(cancel) == TradeCancel
+    assert cancel.id == 4868
+    assert cancel.exchange == "D"
+    assert cancel.price == 36.18
+
+    created_at = datetime(2024, 6, 17, 14, 11, 0, tzinfo=timezone.utc)
+    news = ws_client._cast(
+        {
+            "T": "n",
+            "id": 39358670,
+            "headline": "Broadcom shares are trading higher. The company last week reported better-than-expected Q2 financial results, issued strong revenue guidance and announced a 10-for-1 forward split.",
+            "summary": "",
+            "author": "Benzinga Newsdesk",
+            "created_at": Timestamp.from_datetime(created_at),
+            "updated_at": Timestamp.from_datetime(created_at),
+            "url": "https://www.benzinga.com/wiim/24/06/39358670/broadcom-shares-are-trading-higher-the-company-last-week-reported-better-than-expected-q2-financial",
+            "content": "",
+            "symbols": ["AVGO"],
+            "source": "benzinga",
+        },
+    )
+    assert type(news) == News
+    assert news.id == 39358670
+    assert news.symbols == ["AVGO"]
+    assert news.created_at == created_at
+
+    # Raw Client
+    raw_bar = raw_ws_client._cast(
+        {
+            "T": "b",
+            "S": "AAPL",
+            "o": 177.94,
+            "c": 178.005,
+            "h": 178.005,
+            "l": 177.94,
+            "v": 8547,
+            "t": timestamp,
+            "n": 66,
+            "vw": 177.987562,
+        },
+    )
+    assert type(raw_bar) == dict
+    assert raw_bar["S"] == "AAPL"
+    assert raw_bar["h"] == 178.005
+
+
+def test_get_websocket_headers_key_returns_valid_param():
+    """Verify that get_websocket_headers_key returns an accepted keyword for websockets.connect."""
+    key = get_websocket_headers_key()
+    assert key in ("additional_headers", "extra_headers")
+
+
+@pytest.mark.asyncio
+async def test_connect_sets_user_agent_header(ws_client: DataStream):
+    """The websocket connection should send the same User-Agent format as REST requests."""
+    mock_ws = AsyncMock()
+    mock_ws.recv.return_value = msgpack.packb([{"T": "success", "msg": "connected"}])
+
+    with patch(
+        "alpaca.data.live.websocket.websockets.connect",
+        new=AsyncMock(return_value=mock_ws),
+    ) as mock_connect:
+        await ws_client._connect()
+
+    _, kwargs = mock_connect.call_args
+    headers = kwargs.get("additional_headers") or kwargs.get("extra_headers")
+    assert headers["User-Agent"] == get_default_user_agent()
+
+
+@pytest.mark.asyncio
+async def test_connect_preserves_user_agent_when_extra_headers_overridden(
+    ws_client: DataStream,
+):
+    """Caller-supplied extra_headers must not drop the standardized User-Agent."""
+    mock_ws = AsyncMock()
+    mock_ws.recv.return_value = msgpack.packb([{"T": "success", "msg": "connected"}])
+    ws_client._websocket_params = {
+        "ping_interval": 10,
+        "extra_headers": {"X-Test": "1", "User-Agent": "custom-agent"},
+    }
+
+    with patch(
+        "alpaca.data.live.websocket.websockets.connect",
+        new=AsyncMock(return_value=mock_ws),
+    ) as mock_connect:
+        await ws_client._connect()
+
+    _, kwargs = mock_connect.call_args
+    headers = kwargs.get("additional_headers") or kwargs.get("extra_headers")
+    assert headers["X-Test"] == "1"
+    assert headers["User-Agent"] == get_default_user_agent()
+    assert "ping_interval" in kwargs
+
+
+@pytest.mark.asyncio
+async def test_connect_preserves_content_type_when_extra_headers_overridden(
+    ws_client: DataStream,
+):
+    """Caller-supplied extra_headers must not override the msgpack Content-Type."""
+    mock_ws = AsyncMock()
+    mock_ws.recv.return_value = msgpack.packb([{"T": "success", "msg": "connected"}])
+    ws_client._websocket_params = {
+        "extra_headers": {
+            "Content-Type": "application/json",
+            "User-Agent": "custom-agent",
+        },
+    }
+
+    with patch(
+        "alpaca.data.live.websocket.websockets.connect",
+        new=AsyncMock(return_value=mock_ws),
+    ) as mock_connect:
+        await ws_client._connect()
+
+    _, kwargs = mock_connect.call_args
+    headers = kwargs.get("additional_headers") or kwargs.get("extra_headers")
+    assert headers["Content-Type"] == "application/msgpack"
+    assert headers["User-Agent"] == get_default_user_agent()
+
+
+@pytest.mark.asyncio
+async def test_dispatch(ws_client: DataStream, timestamp: Timestamp):
+    articles_a, articles_b, articles_star = [], [], []
+
+    async def handler_a(d):
+        articles_a.append(d)
+
+    async def handler_b(d):
+        articles_b.append(d)
+
+    async def handler_star(d):
+        articles_star.append(d)
+
+    ws_client._subscribe(handler_a, ("A",), ws_client._handlers["news"])
+    ws_client._subscribe(handler_b, ("B",), ws_client._handlers["news"])
+    ws_client._subscribe(handler_star, ("*",), ws_client._handlers["news"])
+
+    msg_a = {
+        "T": "n",
+        "author": "benzinga",
+        "headline": "a",
+        "id": 1,
+        "summary": "a",
+        "content": "",
+        "url": "url",
+        "source": "benzinga",
+        "symbols": ["A"],
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    await ws_client._dispatch(msg_a.copy())
+    assert len(articles_a) == 1
+    assert len(articles_b) == 0
+    assert len(articles_star) == 0
+    assert type(articles_a[0]) == News
+    assert articles_a[0].summary == "a"
+
+    msg_b = msg_a.copy()
+    msg_b["headline"] = "b"
+    msg_b["symbols"] = ["B", "C"]
+    await ws_client._dispatch(msg_b.copy())
+    assert len(articles_a) == 1
+    assert len(articles_b) == 1
+    assert len(articles_star) == 1
+    assert articles_b[0].headline == "b"
+    assert articles_star[0].headline == "b"
+
+    msg_c = msg_a.copy()
+    msg_c["headline"] = "c"
+    msg_c["symbols"] = ["C"]
+    await ws_client._dispatch(msg_c.copy())
+    assert len(articles_a) == 1
+    assert len(articles_b) == 1
+    assert len(articles_star) == 2
+    assert articles_star[1].headline == "c"
+
+
+@pytest.mark.parametrize(
+    "feed, endpoint",
+    [
+        (DataFeed.IEX, "wss://stream.data.alpaca.markets/v2/iex"),
+        (DataFeed.SIP, "wss://stream.data.alpaca.markets/v2/sip"),
+        (DataFeed.DELAYED_SIP, "wss://stream.data.alpaca.markets/v2/delayed_sip"),
+        (DataFeed.BOATS, "wss://stream.data.alpaca.markets/v1beta1/boats"),
+        (DataFeed.OVERNIGHT, "wss://stream.data.alpaca.markets/v1beta1/overnight"),
+    ],
+)
+def test_stock_data_stream_feed_endpoint(feed: DataFeed, endpoint: str):
+    assert StockDataStream("key-id", "secret-key", feed=feed)._endpoint == endpoint
+
+
+def test_stock_data_stream_rejects_unsupported_feed():
+    with pytest.raises(ValueError):
+        StockDataStream("key-id", "secret-key", feed=DataFeed.OTC)
+
+
+@pytest.mark.asyncio
+async def test_run_forever_unblocks_on_subscribe(ws_client: DataStream):
+    """DataStream should suspend startup until a qualifying handler is registered."""
+
+    async def mock_handler(data):
+        pass
+
+    async def mock_consume_side_effect(_run=None):
+        await ws_client.stop_ws()
+
+    with (
+        patch.object(ws_client, "_start_ws", new_callable=AsyncMock) as mock_start,
+        patch.object(ws_client, "_send_subscribe_msg", new_callable=AsyncMock),
+        patch.object(ws_client, "_consume", new_callable=AsyncMock) as mock_consume,
+    ):
+        mock_consume.side_effect = mock_consume_side_effect
+
+        task = asyncio.create_task(ws_client._run_forever())
+        await asyncio.sleep(0.05)
+        assert not mock_start.called
+
+        ws_client._subscribe(mock_handler, ("AAPL",), ws_client._handlers["quotes"])
+        await asyncio.wait_for(task, timeout=2.0)
+        assert mock_start.called
+
+
+@pytest.mark.asyncio
+async def test_run_forever_ignores_non_qualifying_subscriptions(ws_client: DataStream):
+    """DataStream should not start on cancelErrors/corrections alone until a data channel is subscribed."""
+
+    async def mock_handler(data):
+        pass
+
+    async def mock_consume_side_effect(_run=None):
+        await ws_client.stop_ws()
+
+    with (
+        patch.object(ws_client, "_start_ws", new_callable=AsyncMock) as mock_start,
+        patch.object(ws_client, "_send_subscribe_msg", new_callable=AsyncMock),
+        patch.object(ws_client, "_consume", new_callable=AsyncMock) as mock_consume,
+    ):
+        mock_consume.side_effect = mock_consume_side_effect
+
+        task = asyncio.create_task(ws_client._run_forever())
+        await asyncio.sleep(0.05)
+
+        ws_client._subscribe(
+            mock_handler, ("AAPL",), ws_client._handlers["cancelErrors"]
+        )
+        await asyncio.sleep(0.05)
+        assert not mock_start.called
+
+        ws_client._subscribe(mock_handler, ("AAPL",), ws_client._handlers["quotes"])
+        await asyncio.wait_for(task, timeout=2.0)
+        assert mock_start.called
+
+
+@pytest.mark.asyncio
+async def test_run_forever_stops_cleanly_when_no_subscriptions(ws_client: DataStream):
+    """DataStream should exit cleanly on stop_ws() without ever starting connection if unsubscribed."""
+    with patch.object(ws_client, "_start_ws", new_callable=AsyncMock) as mock_start:
+        task = asyncio.create_task(ws_client._run_forever())
+        await asyncio.sleep(0.05)
+        assert not mock_start.called
+
+        await ws_client.stop_ws()
+        await asyncio.wait_for(task, timeout=2.0)
+        assert not mock_start.called
+
+
+def test_run_forever_unblocks_on_subscribe_cross_thread(ws_client: DataStream):
+    """DataStream should unblock when subscribed from an external thread/loop."""
+    loop = asyncio.new_event_loop()
+    started_event = threading.Event()
+    unblocked_event = threading.Event()
+
+    async def mock_start_ws():
+        unblocked_event.set()
+        await ws_client.stop_ws()
+
+    async def runner():
+        with (
+            patch.object(ws_client, "_start_ws", side_effect=mock_start_ws),
+            patch.object(ws_client, "_send_subscribe_msg", new_callable=AsyncMock),
+            patch.object(ws_client, "_consume", new_callable=AsyncMock),
+        ):
+            started_event.set()
+            await ws_client._run_forever()
+
+    thread = threading.Thread(target=lambda: loop.run_until_complete(runner()))
+    thread.start()
+
+    try:
+        assert started_event.wait(timeout=2.0)
+        for _ in range(100):
+            if (
+                ws_client._loop is not None
+                and ws_client._loop.is_running()
+                and ws_client._run is not None
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("stream did not reach the idle wait")
+        assert not unblocked_event.is_set()
+
+        async def dummy_handler(data):
+            pass
+
+        ws_client._subscribe(dummy_handler, ("AAPL",), ws_client._handlers["quotes"])
+        assert unblocked_event.wait(timeout=2.0)
+    finally:
+        thread.join(timeout=2.0)
+        loop.close()
+
+
+def test_run_forever_stops_cleanly_cross_thread_when_no_subscriptions(
+    ws_client: DataStream,
+):
+    """DataStream should exit cleanly when stop_ws is called from an external thread/loop."""
+    loop = asyncio.new_event_loop()
+    started_event = threading.Event()
+
+    async def runner():
+        with patch.object(ws_client, "_start_ws", new_callable=AsyncMock) as mock_start:
+            started_event.set()
+            await ws_client._run_forever()
+            assert not mock_start.called
+
+    thread = threading.Thread(target=lambda: loop.run_until_complete(runner()))
+    thread.start()
+
+    try:
+        assert started_event.wait(timeout=2.0)
+        for _ in range(100):
+            if (
+                ws_client._loop is not None
+                and ws_client._loop.is_running()
+                and ws_client._run is not None
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("stream did not reach the idle wait")
+        asyncio.run(ws_client.stop_ws())
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+    finally:
+        if thread.is_alive():
+            thread.join(timeout=1.0)
+        loop.close()
